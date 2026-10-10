@@ -726,26 +726,47 @@ database. The textbook estimates do not prove that the actual
 SQLite plan is more expensive than an unavailable algorithm would
 be in practice.
 
+
+```latex
 \subsection{Three-Table Join Ordering}
 
-For a query involving \texttt{Session}, \texttt{Turn}, and
-\texttt{PromptTemplateVersion}, a reasonable join order is to
-filter \texttt{Session} by the date range first, then join the
-remaining sessions to \texttt{Turn}, and finally look up the
-corresponding template versions.
+Consider a query joining \texttt{Session}, \texttt{Turn}, and
+\texttt{PromptTemplateVersion}, with a date-range predicate on
+\texttt{Session.started\_at}. A reasonable join order is to filter
+\texttt{Session} first, join the qualifying sessions to \texttt{Turn},
+and then retrieve the corresponding template versions.
 
-The reasoning is that the date condition can reduce the number
-of session rows before they are joined to the larger turn relation.
-The recorded F7 plan after index creation follows this general
-strategy: it searches the session date range, searches turns by
-session ID, and looks up template versions by integer primary key.
+The measured cardinalities support this choice. Filtering
+\texttt{Session} to August 2026 produces 15,886 rows. Joining these
+sessions to \texttt{Turn} produces 43,779 rows. By comparison, joining
+the complete \texttt{Turn} relation to \texttt{PromptTemplateVersion}
+without applying the date filter produces 276,011 rows. The complete
+three-table query with the August predicate returns 43,779 rows.
 
-This is a plausible join order based on the predicate and the
-available indexes. A definitive claim that it is the cheapest
-possible order would require estimated intermediate cardinalities
-for competing orders or measured comparisons. Those candidate
-intermediate-result estimates were not recorded, so I do not claim
-to have proved a globally cheapest order.
+The SQLite execution plan for the date-filtered query is:
+
+\begin{samepage}
+\small
+\begin{lstlisting}
+SEARCH s USING COVERING INDEX idx_session_started_session
+    (started_at>? AND started_at<?)
+SEARCH t USING INDEX sqlite_autoindex_Turn_1 (session_id=?)
+SEARCH ptv USING INTEGER PRIMARY KEY (rowid=?)
+\end{lstlisting}
+\end{samepage}
+
+The plan uses the date-range index to find qualifying sessions,
+searches \texttt{Turn} using the session ID, and retrieves matching
+template versions using their integer primary key. This is consistent
+with the proposed filtered-session-first strategy.
+
+These measurements support the proposed join order but do not prove
+that it is globally cheapest. The 276,011-row measurement represents
+the unfiltered \texttt{Turn}-to-\texttt{PromptTemplateVersion} join,
+whereas the 43,779-row result includes the August session predicate.
+A definitive comparison of all candidate orders would require
+comparable intermediate-cardinality estimates and cost measurements
+for each alternative.
 
 % ============================================================
 \section{Task 4: Predicate Pushdown}
@@ -897,7 +918,15 @@ The rewritten query makes the early selection explicit.
 
 \subsection{Execution-Plan Evidence}
 
-The recorded F7 plan after index creation includes:
+Both the original and rewritten queries produced the same
+execution-plan operations. SQLite uses the date-range index
+\texttt{idx\_session\_started\_session} to search qualifying
+sessions, looks up turns by session ID, retrieves template
+versions using their integer primary key, and searches pricing
+periods using the relevant index. Both plans also use temporary
+B-trees for grouping and ordering.
+
+The recorded plan for the original query is:
 
 \begin{lstlisting}[style=textstyle]
 SEARCH s USING COVERING INDEX idx_session_started_session
@@ -910,18 +939,37 @@ USE TEMP B-TREE FOR GROUP BY
 USE TEMP B-TREE FOR ORDER BY
 \end{lstlisting}
 
-The range search on \texttt{Session} demonstrates that SQLite uses
-the date index for the original query. This is consistent with
-applying the selective predicate early. It does not, by itself,
-prove that the explicit common-table-expression rewrite is faster:
-SQLite may already perform an equivalent optimization on the
-original query.
+\subsection{Runtime Comparison}
 
-The original F7 query took 0.08 seconds in the recorded
-after-index run. A directly comparable timing experiment between
-the original SQL and the explicit CTE rewrite was not performed.
-Therefore, the index timing does not establish an additional
-performance benefit from predicate pushdown.
+I executed both queries five times, alternating their execution
+order. Each execution returned 38,005 rows, and the ordered
+results were identical in every round.
+
+The median execution times were:
+
+\begin{center}
+\begin{tabular}{lr}
+\hline
+Query & Median runtime (seconds) \\
+\hline
+Original SQL & 0.0790 \\
+Rewritten SQL & 0.0784 \\
+\hline
+\end{tabular}
+\end{center}
+
+The rewritten query was approximately 0.76\% faster based on
+these median measurements. This difference is too small to
+establish a meaningful performance improvement from the rewrite.
+The first execution of the original query took 0.2910 seconds,
+whereas subsequent executions were much faster, indicating that
+warm-up or caching effects may influence the measurements.
+
+The execution plans and timing results suggest that SQLite's
+optimizer already applies the beneficial filtering strategy to
+the original query. Therefore, making the predicate pushdown
+explicit using a common table expression does not produce a
+meaningful observed improvement in this experiment.
 
 % ============================================================
 \section{Task 5: Concurrency, Schedules, and Isolation}
@@ -1050,29 +1098,86 @@ Connection 1: ROLLBACK complete
 
 Connection 1 rolled back successfully. This confirms that the
 second connection could not acquire the writer reservation during
-this test. The experiment demonstrates writer serialization in
-the tested scenario; it does not demonstrate a committed
-write-skew anomaly.
+this test. 
+
+```latex
+\subsection{Observed Lost Update and Prevention}
+
+To demonstrate an actual concurrency anomaly, I created a small,
+separate SQLite database named \texttt{concurrency\_demo\_small.db}.
+The table contained one account with an initial balance of 100.
+Two independent connections each attempted to deduct 10 from the
+balance.
+
+In the unsafe experiment, both connections read the balance before
+either updated it. Each calculated the new balance from its own
+read value and wrote 90. Consequently, the second write overwrote
+the first deduction.
+
+The observed output was:
+
+\begin{lstlisting}[style=textstyle]
+PART A: UNSAFE READ-MODIFY-WRITE
+T1 reads balance=100
+T2 reads balance=100
+T2 writes balance=90
+T1 writes balance=90
+Expected balance if both deductions apply: 80
+Actual final balance: 90
+\end{lstlisting}
+
+The final balance of 90 demonstrates a lost update: both
+transactions completed their deductions logically, but only one
+deduction was reflected in the stored balance.
+
+I then repeated the experiment with \texttt{BEGIN IMMEDIATE}
+issued before each transaction read the balance. The transaction
+that acquired the writer reservation first read and updated the
+balance and committed. The second transaction then read the
+updated balance and applied its deduction.
+
+The observed output was:
+
+\begin{lstlisting}[style=textstyle]
+PART B: BEGIN IMMEDIATE
+T1 reads balance=100
+T1 commits balance=90
+T2 reads balance=90
+T2 commits balance=80
+Expected final balance: 80
+Actual final balance: 80
+
+PASS: Both deductions applied under transaction locking.
+\end{lstlisting}
+
+The final balance of 80 confirms that both deductions were
+preserved in the protected experiment. This demonstrates the
+prevention of the observed lost update when the complete
+read-modify-write operation is performed inside a transaction
+that acquires its writer reservation before reading.
+
+This experiment uses a separate account table to isolate the
+concurrency behaviour. It demonstrates a lost update and its
+prevention, rather than a committed write-skew anomaly in the
+ScrollSense moderation schema.
+```
 
 \subsection{Prevention and Trade-Off}
 
-The proposed prevention is to use \texttt{BEGIN IMMEDIATE} before
-reading and validating the invariant. The transaction reserves
-the writer slot before making its decision, preventing another
-writer from independently completing the same read-then-write
-sequence at the same time.
+The experiment demonstrates that \texttt{BEGIN IMMEDIATE} can
+prevent the observed lost update when the transaction acquires
+the writer reservation before reading and retains it through the
+update and commit. The earlier two-connection locking test also
+showed that a second connection could not acquire the writer
+reservation while the first connection held it.
 
-The observed test confirms that a second connection can be blocked
-from acquiring the writer reservation while the first holds it.
-A full demonstration that the same write-skew schedule is prevented
-and that the final application invariant is preserved would require
-running and recording the complete read, validation, update, and
-final-state sequence.
-
-The trade-off is that competing writers must serialize, which can
-increase waiting time. If a connection cannot acquire the writer
-reservation within its timeout, it may receive \texttt{SQLITE\_BUSY}
-and need to retry its transaction.
+The trade-off is that competing writers must serialize, which
+can increase waiting time and reduce write concurrency. If a
+connection cannot acquire the writer reservation within its
+configured timeout, SQLite may return \texttt{SQLITE\_BUSY};
+the application may then need to retry the transaction. The
+transaction should be retried as a whole so that its reads and
+decisions are made against current data.
 
 % ============================================================
 \section{Conclusion}
@@ -1099,12 +1204,14 @@ execution plan already shows an indexed range search on
 \texttt{Session}, so the plan supports early filtering but does
 not establish an additional speedup from the rewrite.
 
-Finally, the two-connection experiment demonstrated that
-\texttt{BEGIN IMMEDIATE} reserves the writer slot and prevents a
-second connection from acquiring it while the first holds it.
-The proposed write-skew schedule has a cyclic precedence graph,
-but a committed anomalous outcome was not observed. I have kept
-this distinction explicit in the report.
+Finally, the concurrency experiments demonstrated a lost update
+under an unsafe read-modify-write sequence: the final balance
+was 90 instead of the expected 80. Repeating the experiment with
+\texttt{BEGIN IMMEDIATE} preserved both deductions and produced
+the expected final balance of 80. The separate write-skew schedule
+has a cyclic precedence graph, but a committed write-skew outcome
+was not observed in SQLite. These results distinguish the observed
+lost-update anomaly from the theoretical write-skew analysis.
 
 The three index experiments have recorded before-and-after
 wall-clock measurements: F4 took 0.09 seconds before and 0.03
