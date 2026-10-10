@@ -248,9 +248,10 @@ the referenced signal ID and timestamp, which makes it covering for
 the columns needed from the \texttt{r} alias. The sort remains because
 the index does not directly provide the complete requested ordering.
 
-This plan demonstrates a change in access path. A complete,
-controlled before-and-after wall-clock comparison was not recorded,
-so I do not claim a numerical speedup for F4.
+The F4 query took 0.09 seconds before the index was created
+and 0.03 seconds after it was recreated. This is a single-run
+observation rather than a controlled benchmark, so cache state
+and system load may affect the measured difference.
 
 \subsection{F7: Session-Level Inference Cost}
 
