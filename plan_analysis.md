@@ -144,10 +144,27 @@ This index could support the recommendation, video, and user matching conditions
 
 ### Runtime comparison
 
-The before-and-after execution plans were captured for the three index experiments. For F4, the plan changed from a full scan of the retraction-side `Signal` table to a search using `idx_signal_type_retracts_created`. For F7, the plan changed from a full scan of `Turn` to an indexed date-range search on `Session`, followed by indexed lookups into `Turn`. For F12, the correlated `EXISTS` lookup changed from an automatically created partial covering index to the persistent covering index `idx_viewsegment_impression_reached`.
+The following wall-clock times were measured by running each complete query
+with its target index absent and then present. The SQL and parameters were
+kept the same within each pair.
 
-A complete, controlled set of before-and-after wall-clock timings for all three queries has not been recorded. The captured execution plans establish changes in access paths, but they do not establish numerical runtime improvements. Therefore, no speedup is claimed. The rejected `Impression` index was not built, so its storage and performance trade-off remains a qualitative assessment.
+| Query | Before index (s) | After index (s) | Observed reduction |
+|---|---:|---:|---:|
+| F4 — Signal retractions | 0.09 | 0.03 | 66.7% |
+| F7 — Session cost | 0.13 | 0.08 | 38.5% |
+| F12 — Completed recommendations | 6.94 | 3.46 | 50.1% |
 
+The observed reduction is calculated as
+((before time - after time) / before time) * 100.
+These are single-run measurements, not controlled benchmarks. Cache state,
+system load, and query-planning effects may influence the results. They
+should therefore be treated as preliminary observations rather than
+definitive performance guarantees. The execution plans provide complementary
+evidence of the access-path changes.
+
+All three target indexes were recreated after their respective baseline
+measurements. The rejected Impression index was not built, so its storage and
+performance trade-off remains a qualitative assessment.
 ## 3. Join strategy and cost model
 
 F10 joins `ViewSegment` and `Impression`, both high-volume tables. F12 also matches these tables and connects them to recommendation, turn, and session records.

@@ -315,11 +315,10 @@ looks up matching turns. The leading \texttt{started\_at} column
 supports the range predicate. The remaining joins and temporary
 grouping and sorting structures are still required.
 
-One recorded run of F7 after index creation took approximately
-0.548 seconds of real time, 0.084 seconds of user CPU time, and
-0.076 seconds of system CPU time. I did not record a comparable
-before-index runtime, so this measurement cannot establish a
-before-and-after speedup.
+The full F7 query took 0.13 seconds before the target index
+was created and 0.08 seconds after it was recreated. These are
+single-run wall-clock measurements; cache state and system load
+may affect the observed difference.
 
 \subsection{F10: Rolling Watch Analysis}
 
@@ -557,13 +556,28 @@ of \texttt{Turn} to an indexed date-range search on
 partial covering index to the persistent covering index for the
 completion check.
 
-A complete, controlled set of before-and-after wall-clock timings
-for all three queries was not recorded. The recorded F7 runtime
-after index creation is approximately 0.548 seconds, but a
-comparable baseline timing is unavailable. The plans establish
-changes in access paths; they do not establish numerical runtime
-improvements. I therefore do not report a speedup for any of the
-three index experiments.
+The complete queries were timed once with the target index absent
+and once after recreating it. The measured wall-clock times were:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Query & Before (s) & After (s) & Observed reduction (\%) \\
+\midrule
+F4: Signal retractions & 0.09 & 0.03 & 66.7 \\
+F7: Session cost & 0.13 & 0.08 & 38.5 \\
+F12: Completed recommendations & 6.94 & 3.46 & 50.1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The observed reduction is calculated as
+$(T_{\mathrm{before}}-T_{\mathrm{after}})/T_{\mathrm{before}}
+\times 100$. These are single-run measurements, not controlled
+benchmarks. Cache state and system load may affect the results, so
+the reductions are preliminary observations rather than guaranteed
+performance improvements. The execution plans provide complementary
+evidence of changes in access paths.
 
 % ============================================================
 \section{Task 3: Join Strategy and Cost Model}
@@ -902,10 +916,11 @@ prove that the explicit common-table-expression rewrite is faster:
 SQLite may already perform an equivalent optimization on the
 original query.
 
-The recorded runtime of the original F7 query after index creation
-was approximately 0.548 seconds. I did not establish directly
-comparable runtimes for both SQL versions, so I do not claim a
-numerical runtime improvement from the rewrite.
+The original F7 query took 0.08 seconds in the recorded
+after-index run. A directly comparable timing experiment between
+the original SQL and the explicit CTE rewrite was not performed.
+Therefore, the index timing does not establish an additional
+performance benefit from predicate pushdown.
 
 % ============================================================
 \section{Task 5: Concurrency, Schedules, and Isolation}
@@ -1090,12 +1105,14 @@ The proposed write-skew schedule has a cyclic precedence graph,
 but a committed anomalous outcome was not observed. I have kept
 this distinction explicit in the report.
 
-The main limitation of the current experimental record is the lack
-of a complete, controlled set of before-and-after wall-clock
-measurements for all three index experiments and for both versions
-of the predicate-pushdown query. The report therefore uses the
-recorded plans and runtime evidence without claiming unmeasured
-performance improvements.
+The three index experiments have recorded before-and-after
+wall-clock measurements: F4 took 0.09 seconds before and 0.03
+seconds after indexing; F7 took 0.13 and 0.08 seconds; and F12
+took 6.94 and 3.46 seconds. These are single-run observations,
+not controlled benchmarks, and may be affected by cache state
+and system load. A directly comparable timing experiment for the
+original F7 SQL and the explicit predicate-pushdown rewrite
+remains outstanding.
 
 % ============================================================
 \section*{Appendix: Reproducibility and Assistance}
