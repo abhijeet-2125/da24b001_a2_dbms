@@ -1,0 +1,137 @@
+
+PRAGMA foreign_keys = ON;
+
+
+-- Part A: Read isolation using moderation history
+-- Connection 1:
+-- BEGIN;
+-- INSERT INTO ModerationDecision(
+--     video_id, state, decided_by_type, reviewer_user_id,
+--     classifier_version, decided_at
+-- )
+-- VALUES(
+--     1, 'demoted', 'classifier', NULL,
+--     'concurrency-demo', '2099-01-01T00:00:00Z'
+-- );
+--
+-- In Connection 1, inspect the latest decision:
+-- SELECT video_id, state, decided_at
+-- FROM (
+--     SELECT video_id, state, decided_at,
+--            ROW_NUMBER() OVER (
+--                PARTITION BY video_id
+--                ORDER BY decided_at DESC, decision_id DESC
+--            ) AS rn
+--     FROM ModerationDecision
+-- )
+-- WHERE video_id = 1 AND rn = 1;
+--
+-- While Connection 1 remains uncommitted, run the same SELECT
+-- in Connection 2. It should not see Connection 1's new row.
+-- Finally, run ROLLBACK in Connection 1.
+
+
+-- Part B: Non-conflict-serializable schedule
+-- This is a deliberately artificial invariant for the demo:
+-- at least one of videos 1 and 2 must remain 'live'.
+--
+-- Use a disposable database copy and two connections.
+-- Each transaction reads both current states, then updates a
+-- different video. With both transactions reading the original
+-- state before either update, both may decide the other video
+-- can be demoted. The resulting state violates the invariant.
+--
+-- Connection 1:
+-- BEGIN;
+-- SELECT video_id, state FROM (
+--     SELECT video_id, state,
+--            ROW_NUMBER() OVER (
+--                PARTITION BY video_id
+--                ORDER BY decided_at DESC, decision_id DESC
+--            ) AS rn
+--     FROM ModerationDecision
+-- ) WHERE rn = 1 AND video_id IN (1, 2);
+--
+-- Connection 2:
+-- BEGIN;
+-- SELECT video_id, state FROM (
+--     SELECT video_id, state,
+--            ROW_NUMBER() OVER (
+--                PARTITION BY video_id
+--                ORDER BY decided_at DESC, decision_id DESC
+--            ) AS rn
+--     FROM ModerationDecision
+-- ) WHERE rn = 1 AND video_id IN (1, 2);
+--
+-- SQLite permits only one writer at a time. In WAL mode, once
+-- Connection 1 writes, Connection 2's attempt to write from its
+-- older read snapshot can fail with SQLITE_BUSY_SNAPSHOT.
+-- Therefore, this exact schedule may be rejected by SQLite rather
+-- than allowing both transactions to commit. Do not claim that
+-- SQLite committed a write-skew anomaly unless you observed it.
+--
+
+-- Part C: Write-lock prevention
+-- Connection 1:
+-- BEGIN IMMEDIATE;
+-- SELECT video_id, state
+-- FROM ModerationDecision
+-- WHERE video_id IN (1, 2)
+-- ORDER BY video_id, decided_at DESC;
+--
+-- Connection 2 should attempt BEGIN IMMEDIATE and wait or fail
+-- with SQLITE_BUSY, depending on its busy timeout.
+-- Connection 1 can now safely validate the invariant and decide
+-- whether to write. Finish with ROLLBACK for this demonstration.
+--
+-- BEGIN IMMEDIATE reserves SQLite's writer slot early. This
+-- prevents another writer from independently passing a stale
+-- read-then-write check, but it serializes writers and can
+-- increase waiting or SQLITE_BUSY errors.
+
+-- Part D: Conflict-serializability analysis of the proposed schedule
+-- Abstract schedule (assuming both transactions could commit):
+-- T1: R(state of video 1), R(state of video 2), W(video 1)
+-- T2: R(state of video 1), R(state of video 2), W(video 2)
+--
+-- If T1 writes video 1 after T2 has read video 1, the conflict
+-- R2(video 1) before W1(video 1) gives edge T2 -> T1.
+-- If T2 writes video 2 after T1 has read video 2, the conflict
+-- R1(video 2) before W2(video 2) gives edge T1 -> T2.
+--
+-- Precedence graph:
+--             T1 -----> T2
+--              ^         |
+--              |         |
+--              +---------+
+-- The graph contains a cycle (T1 -> T2 -> T1), so the abstract
+-- schedule is NOT conflict-serializable.
+--
+-- Expected invariant violation: both transactions may independently
+-- decide the other video can be demoted, leaving neither video live.
+-- This is the logical write-skew scenario, not a claim that SQLite
+-- committed both writes. SQLite's single-writer and WAL snapshot
+-- rules may abort one transaction instead.
+--
+-- Prevention: acquire the writer reservation before checking the
+-- invariant, using BEGIN IMMEDIATE, then read both states, validate,
+-- and perform any updates in the same transaction. This prevents
+-- concurrent writers from both making decisions based on stale state.
+-- Cost: writers serialize and may wait or receive SQLITE_BUSY.
+
+-- Part E: Observed two-connection BEGIN IMMEDIATE test
+-- Test database: concurrency_test.db (disposable copy).
+-- Python sqlite3 connections used a 1-second timeout.
+--
+-- Observed output:
+-- Connection 1 acquired the writer reservation using BEGIN IMMEDIATE.
+-- Connection 2 attempted BEGIN IMMEDIATE and returned:
+-- OperationalError: database is locked
+-- Connection 1 then rolled back successfully.
+--
+-- Interpretation:
+-- This confirms that the second connection could not acquire the
+-- writer reservation while the first connection held it. The result
+-- demonstrates writer serialization for this test. It does not,
+-- by itself, demonstrate a committed write-skew anomaly or prove
+-- the outcome of every possible concurrent schedule.

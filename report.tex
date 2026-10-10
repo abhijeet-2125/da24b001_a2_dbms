@@ -1,0 +1,1116 @@
+
+\documentclass[11pt,a4paper]{article}
+
+% -------------------- Packages --------------------
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{enumitem}
+\usepackage{float}
+
+% -------------------- Formatting --------------------
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    urlcolor=blue!50!black,
+    citecolor=blue!50!black
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{ScrollSense -- Assignment 2}
+\rhead{Database Systems}
+\cfoot{\thepage}
+\setlength{\headheight}{14pt}
+
+\definecolor{codebg}{RGB}{247,247,247}
+\definecolor{codeframe}{RGB}{210,210,210}
+\definecolor{codeblue}{RGB}{30,70,140}
+\definecolor{codegreen}{RGB}{30,110,70}
+
+\lstdefinestyle{sqlstyle}{
+    language=SQL,
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    frame=single,
+    rulecolor=\color{codeframe},
+    breaklines=true,
+    showstringspaces=false,
+    keywordstyle=\color{codeblue}\bfseries,
+    commentstyle=\color{codegreen},
+    numbers=none,
+    tabsize=4,
+    columns=fullflexible,
+    keepspaces=true
+}
+
+\lstdefinestyle{textstyle}{
+    basicstyle=\ttfamily\footnotesize,
+    backgroundcolor=\color{codebg},
+    frame=single,
+    rulecolor=\color{codeframe},
+    breaklines=true,
+    numbers=none,
+    columns=fullflexible,
+    keepspaces=true
+}
+
+\newcommand{\studentname}{Abhijeet Kumar}
+\newcommand{\studentid}{DA24B001}
+\newcommand{\course}{Data Management}
+\newcommand{\assignment}{Assignment 2: Query Processing and Concurrency}
+
+\title{
+    \textbf{ScrollSense}\\[0.4em]
+    \large \assignment
+}
+\author{
+    \studentname\\
+    \studentid\\
+    Indian Institute of Technology Madras
+}
+\date{October 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\vspace{1em}
+
+\begin{abstract}
+In this assignment, I investigated query execution plans, composite
+indexes, join algorithms, predicate pushdown, and transaction
+concurrency using the ScrollSense database. I scaled the dataset,
+examined SQLite execution plans before and after index creation,
+estimated the I/O cost of alternative join strategies, and rewrote
+a query to make predicate pushdown explicit. I also tested SQLite's
+writer-locking behaviour using two independent database connections.
+
+The experiments show that appropriate indexes can change SQLite's
+access paths, while the query planner still uses temporary structures
+for operations such as grouping and ordering. The concurrency test
+confirms that \texttt{BEGIN IMMEDIATE} prevents a second connection
+from acquiring a writer reservation while the first connection holds
+it. Where comparable timing measurements or experimental outcomes
+were not recorded, I distinguish the available evidence from
+theoretical analysis rather than reporting unsupported results.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Experimental Setup}
+% ============================================================
+
+\subsection{Environment}
+
+I carried out the experiments on a MacBook Air using Python and
+SQLite. I kept the original Assignment 1 files separate from the
+working files for Assignment 2 so that the original schema and
+queries remained available for reference.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Item} & \textbf{Configuration} \\
+\midrule
+Database engine & SQLite 3.54.0 \\
+Python & 3.14.8 in a virtual environment \\
+Operating system & macOS \\
+Database & \texttt{scrollsense\_a2.db} \\
+Scale factor & 50$\times$ \\
+Assumed page size for cost model & 4096 bytes \\
+Assumed average row size & 64 bytes \\
+\bottomrule
+\end{tabular}
+\caption{Experimental environment and cost-model assumptions.}
+\end{table}
+
+I generated a scaled database with a scale factor of 50. The resulting
+database passed SQLite's integrity check. The following row counts
+were recorded after generation.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Table} & \textbf{Recorded rows} \\
+\midrule
+User & 250,000 \\
+Video & 1,000,000 \\
+Impression & 15,000,000 \\
+ViewSegment & 8,892,547 \\
+Signal & 562,275 \\
+Session & 100,000 \\
+Turn & 276,011 \\
+ToolCall & 218,196 \\
+\bottomrule
+\end{tabular}
+\caption{Selected row counts in the scaled database.}
+\end{table}
+
+I also made a small correction to the data generator so that generated
+phone numbers remain unique at the larger scale. I kept this change
+in the Assignment 2 working copy rather than modifying the original
+Assignment 1 version.
+
+\subsection{Method}
+
+For query-plan analysis, I used SQLite's \texttt{EXPLAIN QUERY PLAN}.
+I compared the recorded plans before and after creating the indexes
+in \texttt{indexes.sql}. I interpreted operators such as
+\texttt{SCAN}, \texttt{SEARCH}, \texttt{USING COVERING INDEX}, and
+\texttt{USE TEMP B-TREE} to understand how SQLite accessed and
+processed the data.
+
+The page-transfer calculations in this report use a simplified
+textbook model. They are estimates, not measurements of physical
+disk I/O. Similarly, an execution plan establishes the access path
+chosen by SQLite but does not, by itself, establish a runtime
+improvement.
+
+% ============================================================
+\section{Task 1: Access Paths and Scan-Cost Estimate}
+% ============================================================
+
+\subsection{F4: Like Retractions Within 60 Seconds}
+
+F4 finds cases where a user liked a video and subsequently retracted
+that like within 60 seconds. The query joins \texttt{Signal} to itself.
+The first alias represents the original like, and the second alias
+represents the retraction.
+
+The relevant conditions are:
+
+\begin{lstlisting}[style=sqlstyle]
+WHERE l.signal_type = 'like'
+  AND r.signal_type = 'like_retraction'
+  AND r.created_at > l.created_at
+  AND (julianday(r.created_at) -
+       julianday(l.created_at)) * 86400 <= 60
+\end{lstlisting}
+
+The query also orders the result by the original like timestamp and
+signal ID.
+
+\subsubsection{Plan before index creation}
+
+\begin{lstlisting}[style=textstyle]
+|--SCAN r
+|--SEARCH l USING INTEGER PRIMARY KEY (rowid=?)
+`--USE TEMP B-TREE FOR ORDER BY
+\end{lstlisting}
+
+The plan scans the retraction-side alias \texttt{r}. For each candidate,
+SQLite searches for the corresponding original signal using its integer
+primary key. A temporary B-tree is used to satisfy the ordering.
+
+The full scan is important because \texttt{Signal} contains 562,275
+rows in the scaled database. The plan does not mean that every pair
+of signals is compared; the primary-key lookup restricts the lookup
+for the matching original signal.
+
+\subsubsection{Plan after index creation}
+
+I created the following index:
+
+\begin{lstlisting}[style=sqlstyle]
+CREATE INDEX IF NOT EXISTS
+    idx_signal_type_retracts_created
+ON Signal(signal_type, retracts_signal_id, created_at);
+\end{lstlisting}
+
+The recorded plan became:
+
+\begin{lstlisting}[style=textstyle]
+|--SEARCH r USING COVERING INDEX
+|  idx_signal_type_retracts_created (signal_type=?)
+|--SEARCH l USING INTEGER PRIMARY KEY (rowid=?)
+`--USE TEMP B-TREE FOR ORDER BY
+\end{lstlisting}
+
+SQLite now searches the index for the requested signal type rather
+than scanning the entire retraction-side table. The index also contains
+the referenced signal ID and timestamp, which makes it covering for
+the columns needed from the \texttt{r} alias. The sort remains because
+the index does not directly provide the complete requested ordering.
+
+This plan demonstrates a change in access path. A complete,
+controlled before-and-after wall-clock comparison was not recorded,
+so I do not claim a numerical speedup for F4.
+
+\subsection{F7: Session-Level Inference Cost}
+
+F7 calculates the cost of each agent session, grouped by prompt
+template version. It joins \texttt{Session}, \texttt{Turn},
+\texttt{PromptTemplateVersion}, and \texttt{ModelPricingPeriod}.
+The query filters sessions to August 2026, aggregates token-based
+costs, applies a \texttt{HAVING} condition, and sorts by session cost.
+
+The date predicate is:
+
+\begin{lstlisting}[style=sqlstyle]
+WHERE s.started_at >= '2026-08-01T00:00:00Z'
+  AND s.started_at <  '2026-09-01T00:00:00Z'
+\end{lstlisting}
+
+\subsubsection{Plan before index creation}
+
+\begin{lstlisting}[style=textstyle]
+|--SCAN t
+|--SEARCH s USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH ptv USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH p USING INDEX
+|  sqlite_autoindex_ModelPricingPeriod_1
+|  (model_id=? AND valid_from<?)
+|--USE TEMP B-TREE FOR GROUP BY
+`--USE TEMP B-TREE FOR ORDER BY
+\end{lstlisting}
+
+The original plan starts by scanning \texttt{Turn}. It then looks up
+the associated session, template version, and pricing period. SQLite
+uses temporary B-trees for grouping and ordering.
+
+\subsubsection{Plan after index creation}
+
+I created an index on the session start time and session ID:
+
+\begin{lstlisting}[style=sqlstyle]
+CREATE INDEX IF NOT EXISTS
+    idx_session_started_session
+ON Session(started_at, session_id);
+\end{lstlisting}
+
+The recorded plan became:
+
+\begin{lstlisting}[style=textstyle]
+|--SEARCH s USING COVERING INDEX
+|  idx_session_started_session
+|  (started_at>? AND started_at<?)
+|--SEARCH t USING INDEX sqlite_autoindex_Turn_1
+|  (session_id=?)
+|--SEARCH ptv USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH p USING INDEX
+|  sqlite_autoindex_ModelPricingPeriod_1
+|  (model_id=? AND valid_from<?)
+|--USE TEMP B-TREE FOR GROUP BY
+`--USE TEMP B-TREE FOR ORDER BY
+\end{lstlisting}
+
+The planner now begins with the date-filtered sessions and then
+looks up matching turns. The leading \texttt{started\_at} column
+supports the range predicate. The remaining joins and temporary
+grouping and sorting structures are still required.
+
+One recorded run of F7 after index creation took approximately
+0.548 seconds of real time, 0.084 seconds of user CPU time, and
+0.076 seconds of system CPU time. I did not record a comparable
+before-index runtime, so this measurement cannot establish a
+before-and-after speedup.
+
+\subsection{F10: Rolling Watch Analysis}
+
+F10 joins the high-volume \texttt{ViewSegment} and \texttt{Impression}
+tables to analyse rolling watch behaviour. The captured plan was:
+
+\begin{lstlisting}[style=textstyle]
+|--CO-ROUTINE rolling_watch
+|  |--MATERIALIZE daily_watch
+|  |  |--SCAN vs
+|  |  |--SEARCH i USING INTEGER PRIMARY KEY (rowid=?)
+|  |  `--USE TEMP B-TREE FOR GROUP BY
+|  |--SCAN d1
+|  |--BLOOM FILTER ON d2 (user_id=?)
+|  |--SEARCH d2 USING AUTOMATIC COVERING INDEX
+|  |  (user_id=?)
+|  `--USE TEMP B-TREE FOR GROUP BY
+|--SCAN rolling_watch
+`--USE TEMP B-TREE FOR ORDER BY
+\end{lstlisting}
+
+The plan materializes the daily-watch intermediate result. It scans
+\texttt{ViewSegment}, searches \texttt{Impression} by integer primary
+key, and uses temporary B-trees for grouping and ordering. The
+self-join of the intermediate result uses a Bloom filter and an
+automatically created covering index on \texttt{user\_id}.
+
+\subsection{F12: Completed Recommendation Impressions}
+
+F12 finds sessions in which a recommended video was shown and
+watched to completion. It joins \texttt{Session}, \texttt{Turn},
+\texttt{AgentRecommendation}, and \texttt{Impression}, and uses a
+correlated \texttt{EXISTS} query against \texttt{ViewSegment}.
+
+\subsubsection{Plan before index creation}
+
+\begin{lstlisting}[style=textstyle]
+|--SCAN i
+|--SEARCH ar USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH s USING INTEGER PRIMARY KEY (rowid=?)
+|--BLOOM FILTER ON vs (impression_id=? AND reached_end=?)
+|--SEARCH vs EXISTS USING AUTOMATIC PARTIAL COVERING INDEX
+|  (impression_id=? AND reached_end=?)
+|--USE TEMP B-TREE FOR DISTINCT
+`--USE TEMP B-TREE FOR ORDER BY
+\end{lstlisting}
+
+SQLite scans \texttt{Impression}, performs primary-key lookups in
+the related tables, and uses an automatically created partial
+covering index for the correlated completion check. Temporary
+B-trees support \texttt{DISTINCT} and ordering.
+
+\subsubsection{Plan after index creation}
+
+I created the following index:
+
+\begin{lstlisting}[style=sqlstyle]
+CREATE INDEX IF NOT EXISTS
+    idx_viewsegment_impression_reached
+ON ViewSegment(impression_id, reached_end);
+\end{lstlisting}
+
+The resulting plan was:
+
+\begin{lstlisting}[style=textstyle]
+|--SCAN i
+|--SEARCH ar USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH vs EXISTS USING COVERING INDEX
+|  idx_viewsegment_impression_reached
+|  (impression_id=? AND reached_end=?)
+|--SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH s USING INTEGER PRIMARY KEY (rowid=?)
+|--USE TEMP B-TREE FOR DISTINCT
+`--USE TEMP B-TREE FOR ORDER BY
+\end{lstlisting}
+
+The persistent covering index is used for the correlated existence
+check. The scan of \texttt{Impression} and the temporary structures
+for duplicate elimination and ordering remain.
+
+\subsection{One Full-Scan Cost Estimate}
+
+For the required scan-cost estimate, I use the recorded full scan
+of \texttt{ViewSegment} in F10.
+
+The table contains:
+
+\[
+N = 8{,}892{,}547 \text{ rows}.
+\]
+
+For a simplified model, I assume a 4096-byte page and an average
+row size of 64 bytes. Therefore, the estimated number of rows per
+page is:
+
+\[
+\text{Rows per page}
+=
+\left\lfloor \frac{4096}{64} \right\rfloor
+=64.
+\]
+
+The estimated number of pages is:
+
+\[
+B(\text{ViewSegment})
+=
+\left\lceil \frac{8{,}892{,}547}{64} \right\rceil
+=
+138{,}946.
+\]
+
+Under these assumptions, a sequential scan reads approximately
+138,946 data pages. This is a simplified page-transfer estimate.
+Actual SQLite I/O depends on its page layout, record sizes, indexes,
+cache state, and other implementation details.
+
+\subsection{Summary of Access-Path Findings}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{1.1cm}p{5.0cm}p{5.0cm}}
+\toprule
+\textbf{Query} & \textbf{Before} & \textbf{After} \\
+\midrule
+F4 &
+Scan of retraction-side \texttt{Signal}; primary-key lookup for
+original signal &
+Indexed search on signal type; primary-key lookup retained \\
+
+F7 &
+Scan of \texttt{Turn}; session lookup by primary key &
+Date-range search on \texttt{Session}; indexed lookup into
+\texttt{Turn} \\
+
+F10 &
+Full scan of \texttt{ViewSegment}; lookup into \texttt{Impression} &
+Plan inspected for high-volume join and aggregation \\
+
+F12 &
+Scan of \texttt{Impression}; automatic partial covering index for
+completion check &
+Persistent covering index for the correlated completion check \\
+\bottomrule
+\end{tabular}
+\caption{Summary of recorded access paths.}
+\end{table}
+
+% ============================================================
+\section{Task 2: Composite-Index Experiments}
+% ============================================================
+
+\subsection{Index 1: Signal Retractions}
+
+The first index is:
+
+\begin{lstlisting}[style=sqlstyle]
+CREATE INDEX IF NOT EXISTS
+    idx_signal_type_retracts_created
+ON Signal(signal_type, retracts_signal_id, created_at);
+\end{lstlisting}
+
+The leading column, \texttt{signal\_type}, supports the equality
+conditions that identify likes and retractions. The next column,
+\texttt{retracts\_signal\_id}, stores the reference to the signal
+being retracted. The timestamp is also stored in the index.
+
+The recorded plan changed from \texttt{SCAN r} to
+\texttt{SEARCH r USING COVERING INDEX}. The plan still contains a
+temporary B-tree for ordering, so the index does not eliminate all
+query-processing work.
+
+\subsection{Index 2: Session Date Range}
+
+The second index is:
+
+\begin{lstlisting}[style=sqlstyle]
+CREATE INDEX IF NOT EXISTS
+    idx_session_started_session
+ON Session(started_at, session_id);
+\end{lstlisting}
+
+The leading \texttt{started\_at} column supports the date-range
+predicate in F7. The \texttt{session\_id} column is included so
+that SQLite can obtain the session identifier directly from the
+index. The recorded plan uses a covering index for the range search.
+
+The plan also changes the join sequence: SQLite starts with
+sessions in the selected date range and then searches for their
+turns. This is consistent with reducing the set of sessions before
+processing subsequent joins.
+
+\subsection{Index 3: View Completion Check}
+
+The third index is:
+
+\begin{lstlisting}[style=sqlstyle]
+CREATE INDEX IF NOT EXISTS
+    idx_viewsegment_impression_reached
+ON ViewSegment(impression_id, reached_end);
+\end{lstlisting}
+
+F12 checks whether an impression has a \texttt{ViewSegment} row
+with \texttt{reached\_end = 1}. Both columns in the correlated
+condition are included in the index. The recorded plan uses this
+persistent covering index instead of the automatically created
+partial covering index that appeared in the baseline plan.
+
+\subsection{Rejected Index}
+
+I considered but did not build the following index:
+
+\begin{lstlisting}[style=sqlstyle]
+-- Not created:
+-- CREATE INDEX idx_impression_recommendation_video_user
+-- ON Impression(recommendation_id, video_id, user_id);
+\end{lstlisting}
+
+This index could support the matching conditions between
+\texttt{Impression} and \texttt{AgentRecommendation} in F12.
+However, \texttt{Impression} contains 15 million rows. Building
+another index on this table would require additional storage and
+index-build time. I left it uncreated rather than claiming a
+performance improvement that I did not measure.
+
+\subsection{Runtime Evidence and Limitations}
+
+The before-and-after execution plans were captured for the three
+index experiments. F4 changed from a scan of the retraction-side
+\texttt{Signal} alias to an indexed search. F7 changed from a scan
+of \texttt{Turn} to an indexed date-range search on
+\texttt{Session}. F12 changed from an automatically created
+partial covering index to the persistent covering index for the
+completion check.
+
+A complete, controlled set of before-and-after wall-clock timings
+for all three queries was not recorded. The recorded F7 runtime
+after index creation is approximately 0.548 seconds, but a
+comparable baseline timing is unavailable. The plans establish
+changes in access paths; they do not establish numerical runtime
+improvements. I therefore do not report a speedup for any of the
+three index experiments.
+
+% ============================================================
+\section{Task 3: Join Strategy and Cost Model}
+% ============================================================
+
+\subsection{Queries Joining High-Volume Tables}
+
+I used F10 and F12 to examine joins involving the large
+\texttt{ViewSegment} and \texttt{Impression} tables. F10 aggregates
+watch information across these tables. F12 matches impressions
+to recommendations and checks completion through
+\texttt{ViewSegment}.
+
+The recorded plans contain scans, indexed searches, primary-key
+lookups, and temporary structures. SQLite uses nested-loop-style
+join processing rather than a native hash join or sort-merge join.
+In these plans, one input is scanned or searched and matching rows
+are retrieved from the other input through indexes or primary-key
+lookups.
+
+This distinction matters because the cost of a nested-loop join
+depends heavily on the access path for the inner input. An indexed
+lookup is not equivalent to repeatedly scanning the entire inner
+table.
+
+\subsection{Cardinality and Page Estimates}
+
+For the simplified cost comparison, I use the recorded row counts
+and assume 64 rows per page:
+
+\[
+B(R) =
+\left\lceil\frac{8{,}892{,}547}{64}\right\rceil
+=138{,}946
+\]
+
+for \texttt{ViewSegment}, and
+
+\[
+B(S) =
+\left\lceil\frac{15{,}000{,}000}{64}\right\rceil
+=234{,}375
+\]
+
+for \texttt{Impression}.
+
+These estimates use the same simplified page-size assumptions
+as Task 1. They are not the actual number of SQLite pages reported
+by the database.
+
+\subsection{Block Nested-Loop Join}
+
+Let \(M=100\) be the assumed number of buffer pages. The textbook
+block nested-loop join estimate is:
+
+\[
+B(R) +
+\left\lceil\frac{B(R)}{M-2}\right\rceil B(S).
+\]
+
+Substituting the estimates gives:
+
+\[
+138{,}946 +
+\left\lceil\frac{138{,}946}{98}\right\rceil
+(234{,}375).
+\]
+
+Since
+
+\[
+\left\lceil\frac{138{,}946}{98}\right\rceil=1{,}418,
+\]
+
+the estimated number of page transfers is:
+
+\[
+138{,}946 + 1{,}418(234{,}375)
+=332{,}482{,}696.
+\]
+
+This is the cost of the simplified block nested-loop model under
+the stated assumptions. It is not a measured cost of the actual
+SQLite execution.
+
+\subsection{Sort-Merge Join}
+
+Under the simplified two-pass model, a sort-merge join can be
+estimated at approximately:
+
+\[
+3(B(R)+B(S)).
+\]
+
+Therefore:
+
+\[
+3(138{,}946+234{,}375)
+=1{,}119{,}963
+\]
+
+page transfers.
+
+This estimate assumes that the inputs can be sorted in the
+available memory and that the relevant two-pass assumptions hold.
+If the data do not fit those assumptions, additional passes may
+be required.
+
+\subsection{Hash Join}
+
+Under the same simplified two-pass assumptions, a Grace hash join
+has an approximate cost of:
+
+\[
+3(B(R)+B(S))
+=1{,}119{,}963
+\]
+
+page transfers.
+
+This estimate assumes that the partitions can be processed within
+the available memory and that the hash-join algorithm's assumptions
+hold. It is a theoretical comparison, not a claim that SQLite used
+a hash join.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Join model} & \textbf{Estimated page transfers} \\
+\midrule
+Block nested-loop & 332,482,696 \\
+Two-pass sort-merge & 1,119,963 \\
+Two-pass Grace hash & 1,119,963 \\
+\bottomrule
+\end{tabular}
+\caption{Theoretical cost comparison under the stated assumptions.}
+\end{table}
+
+Under this simplified model, sort-merge and hash join have much
+lower estimated transfer costs than block nested-loop join for
+these input sizes. However, SQLite's actual plans use the join
+strategies available in SQLite and the indexes present in the
+database. The textbook estimates do not prove that the actual
+SQLite plan is more expensive than an unavailable algorithm would
+be in practice.
+
+\subsection{Three-Table Join Ordering}
+
+For a query involving \texttt{Session}, \texttt{Turn}, and
+\texttt{PromptTemplateVersion}, a reasonable join order is to
+filter \texttt{Session} by the date range first, then join the
+remaining sessions to \texttt{Turn}, and finally look up the
+corresponding template versions.
+
+The reasoning is that the date condition can reduce the number
+of session rows before they are joined to the larger turn relation.
+The recorded F7 plan after index creation follows this general
+strategy: it searches the session date range, searches turns by
+session ID, and looks up template versions by integer primary key.
+
+This is a plausible join order based on the predicate and the
+available indexes. A definitive claim that it is the cheapest
+possible order would require estimated intermediate cardinalities
+for competing orders or measured comparisons. Those candidate
+intermediate-result estimates were not recorded, so I do not claim
+to have proved a globally cheapest order.
+
+% ============================================================
+\section{Task 4: Predicate Pushdown}
+% ============================================================
+
+\subsection{Query and Selective Predicate}
+
+I used F7, which calculates session-level inference costs for
+sessions that started during August 2026. Its selective predicate
+restricts the session relation to the desired date interval:
+
+\begin{lstlisting}[style=sqlstyle]
+s.started_at >= '2026-08-01T00:00:00Z'
+AND s.started_at < '2026-09-01T00:00:00Z'
+\end{lstlisting}
+
+The predicate refers only to the \texttt{Session} relation. This
+makes it suitable for an explicit predicate-pushdown rewrite
+under the query's inner-join semantics.
+
+\subsection{Naive Relational-Algebra Plan}
+
+Let \(S\), \(T\), \(V\), and \(P\) denote \texttt{Session},
+\texttt{Turn}, \texttt{PromptTemplateVersion}, and
+\texttt{ModelPricingPeriod}, respectively. Let \(\sigma_d\)
+denote the selection for the August date range.
+
+A naive logical plan can be represented as:
+
+\[
+\sigma_d(S \bowtie T \bowtie V \bowtie P).
+\]
+
+This places the selection after the joins in the logical expression.
+If implemented literally, it can produce intermediate join results
+containing sessions that are subsequently discarded by the date
+predicate.
+
+\subsection{Pushed-Down Relational-Algebra Plan}
+
+The pushed-down expression is:
+
+\[
+(\sigma_d(S)) \bowtie T \bowtie V \bowtie P.
+\]
+
+This applies the date predicate to \texttt{Session} before the
+joins. The intended benefit is to reduce the number of session
+tuples passed into the subsequent join operations.
+
+\subsection{Equivalence Rule and Limitation}
+
+For inner joins, a selection predicate that refers only to
+attributes of one input relation can be pushed below the join
+without changing the result, provided the join conditions and
+predicate semantics remain unchanged.
+
+This rule must be applied carefully to outer joins. Moving a
+predicate across an outer join can change the result, particularly
+when the predicate filters out NULL-extended rows that the outer
+join was meant to preserve.
+
+\subsection{Original SQL}
+
+\begin{lstlisting}[style=sqlstyle]
+SELECT
+    s.session_id,
+    ptv.template_version_id,
+    ptv.version_number,
+    ROUND(
+        SUM(
+            (t.input_tokens - t.cached_input_tokens) * p.input_rate
+            + t.cached_input_tokens * p.cached_input_rate
+            + t.output_tokens * p.output_rate
+        ),
+        6
+    ) AS session_cost
+FROM Session s
+JOIN Turn t
+    ON t.session_id = s.session_id
+JOIN PromptTemplateVersion ptv
+    ON ptv.template_version_id =
+       t.prompt_template_version_id
+JOIN ModelPricingPeriod p
+    ON p.model_id = t.model_id
+   AND t.created_at >= p.valid_from
+   AND (p.valid_to IS NULL OR t.created_at < p.valid_to)
+WHERE s.started_at >= '2026-08-01T00:00:00Z'
+  AND s.started_at < '2026-09-01T00:00:00Z'
+GROUP BY
+    s.session_id,
+    ptv.template_version_id,
+    ptv.version_number
+HAVING session_cost > 0.05
+ORDER BY
+    session_cost DESC,
+    s.session_id,
+    ptv.version_number;
+\end{lstlisting}
+
+\subsection{Rewritten SQL}
+
+I made the early filtering explicit using a common table expression
+named \texttt{filtered\_sessions}:
+
+\begin{lstlisting}[style=sqlstyle]
+WITH filtered_sessions AS (
+    SELECT session_id, user_id
+    FROM Session
+    WHERE started_at >= '2026-08-01T00:00:00Z'
+      AND started_at < '2026-09-01T00:00:00Z'
+)
+SELECT
+    s.session_id,
+    ptv.template_version_id,
+    ptv.version_number,
+    ROUND(
+        SUM(
+            (t.input_tokens - t.cached_input_tokens) * p.input_rate
+            + t.cached_input_tokens * p.cached_input_rate
+            + t.output_tokens * p.output_rate
+        ),
+        6
+    ) AS session_cost
+FROM filtered_sessions s
+JOIN Turn t
+    ON t.session_id = s.session_id
+JOIN PromptTemplateVersion ptv
+    ON ptv.template_version_id =
+       t.prompt_template_version_id
+JOIN ModelPricingPeriod p
+    ON p.model_id = t.model_id
+   AND t.created_at >= p.valid_from
+   AND (p.valid_to IS NULL OR t.created_at < p.valid_to)
+GROUP BY
+    s.session_id,
+    ptv.template_version_id,
+    ptv.version_number
+HAVING session_cost > 0.05
+ORDER BY
+    session_cost DESC,
+    s.session_id,
+    ptv.version_number;
+\end{lstlisting}
+
+Both versions retain the same date range, join conditions, cost
+calculation, grouping, \texttt{HAVING} condition, and ordering.
+The rewritten query makes the early selection explicit.
+
+\subsection{Execution-Plan Evidence}
+
+The recorded F7 plan after index creation includes:
+
+\begin{lstlisting}[style=textstyle]
+SEARCH s USING COVERING INDEX idx_session_started_session
+    (started_at>? AND started_at<?)
+SEARCH t USING INDEX sqlite_autoindex_Turn_1 (session_id=?)
+SEARCH ptv USING INTEGER PRIMARY KEY (rowid=?)
+SEARCH p USING INDEX sqlite_autoindex_ModelPricingPeriod_1
+    (model_id=? AND valid_from<?)
+USE TEMP B-TREE FOR GROUP BY
+USE TEMP B-TREE FOR ORDER BY
+\end{lstlisting}
+
+The range search on \texttt{Session} demonstrates that SQLite uses
+the date index for the original query. This is consistent with
+applying the selective predicate early. It does not, by itself,
+prove that the explicit common-table-expression rewrite is faster:
+SQLite may already perform an equivalent optimization on the
+original query.
+
+The recorded runtime of the original F7 query after index creation
+was approximately 0.548 seconds. I did not establish directly
+comparable runtimes for both SQL versions, so I do not claim a
+numerical runtime improvement from the rewrite.
+
+% ============================================================
+\section{Task 5: Concurrency, Schedules, and Isolation}
+% ============================================================
+
+\subsection{A1 Deliverable G.3 (T2): Read Isolation}
+
+In the A1 T2 demonstration, Connection 1 began a transaction and
+inserted an uncommitted moderation decision for video 1 with state
+\texttt{live}. Connection 1 then queried the current state of the
+video and could observe its own uncommitted change. Before
+Connection 1 committed, Connection 2 queried the same video and
+observed the previously committed \texttt{pending} state.
+Connection 1 subsequently rolled back.
+
+The relevant operation sequence is:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{clp{8cm}}
+\toprule
+\textbf{Order} & \textbf{Connection} & \textbf{Operation} \\
+\midrule
+1 & C1 & Begin transaction. \\
+2 & C1 & Insert an uncommitted \texttt{live} moderation decision
+for video 1. \\
+3 & C1 & Read the current state and observe \texttt{live}. \\
+4 & C2 & Read the current state and observe the committed
+\texttt{pending} state. \\
+5 & C1 & Roll back the transaction. \\
+\bottomrule
+\end{tabular}
+\caption{Summary of the A1 T2 read-isolation experiment.}
+\end{table}
+
+This experiment demonstrates that Connection 2 does not see
+Connection 1's uncommitted insert. Because Connection 1 rolls back,
+the experiment does not establish a precedence edge between two
+committed transactions that would demonstrate a non-serializable
+schedule.
+
+The corresponding precedence graph for the committed operations
+has no conflict edge between these two transactions. It is
+therefore acyclic for this demonstrated interleaving. This is a
+read-isolation experiment rather than evidence of a committed
+write-skew anomaly.
+
+\subsection{Proposed Write-Skew Scenario}
+
+I considered an application invariant involving videos 1 and 2:
+at least one of these videos must remain in the \texttt{live} state.
+
+The proposed scenario has two transactions. Each reads the latest
+moderation state of both videos. Transaction \(T_1\) then decides
+to update video 1, while transaction \(T_2\) decides to update
+video 2. If both transactions base their decisions on the same
+original state, each may assume that the other video will remain
+live.
+
+The abstract schedule is:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{clp{7.8cm}}
+\toprule
+\textbf{Order} & \textbf{Transaction} & \textbf{Operation} \\
+\midrule
+1 & \(T_1\) & Read state of video 1. \\
+2 & \(T_2\) & Read state of video 1. \\
+3 & \(T_1\) & Read state of video 2. \\
+4 & \(T_2\) & Read state of video 2. \\
+5 & \(T_1\) & Write a new moderation decision for video 1. \\
+6 & \(T_2\) & Write a new moderation decision for video 2. \\
+\bottomrule
+\end{tabular}
+\caption{Abstract schedule for the proposed write-skew scenario.}
+\end{table}
+
+The conflicting operations yield two edges in the precedence graph:
+
+\begin{itemize}[leftmargin=2em]
+    \item \(T_2 \rightarrow T_1\): \(T_2\)'s read of video 1
+    occurs before \(T_1\)'s write to video 1.
+    \item \(T_1 \rightarrow T_2\): \(T_1\)'s read of video 2
+    occurs before \(T_2\)'s write to video 2.
+\end{itemize}
+
+The graph contains a cycle:
+
+\[
+T_1 \rightarrow T_2 \rightarrow T_1.
+\]
+
+Therefore, the abstract schedule is not conflict-serializable.
+If both transactions committed their independent updates, both
+videos could be demoted, violating the assumed invariant. This
+would be a write-skew anomaly.
+
+However, the schedule above is an abstract concurrency analysis.
+It is not evidence that SQLite committed both writes. SQLite
+allows only one writer at a time, and in WAL mode a transaction
+that tries to write from an outdated read snapshot may fail with
+\texttt{SQLITE\_BUSY\_SNAPSHOT}. I did not record a successful
+committed execution of this anomaly.
+
+\subsection{Two-Connection Test of \texttt{BEGIN IMMEDIATE}}
+
+I tested SQLite's writer reservation using two independent Python
+SQLite connections against a disposable copy of the scaled database,
+named \texttt{concurrency\_test.db}. Both connections used a
+one-second timeout.
+
+Connection 1 executed \texttt{BEGIN IMMEDIATE} and acquired the
+writer reservation. While Connection 1 held it, Connection 2
+attempted \texttt{BEGIN IMMEDIATE}. The observed output was:
+
+\begin{lstlisting}[style=textstyle]
+Connection 1: BEGIN IMMEDIATE
+Connection 1: writer reservation acquired
+Connection 2: attempting BEGIN IMMEDIATE
+Connection 2 result: OperationalError: database is locked
+Connection 1: ROLLBACK complete
+\end{lstlisting}
+
+Connection 1 rolled back successfully. This confirms that the
+second connection could not acquire the writer reservation during
+this test. The experiment demonstrates writer serialization in
+the tested scenario; it does not demonstrate a committed
+write-skew anomaly.
+
+\subsection{Prevention and Trade-Off}
+
+The proposed prevention is to use \texttt{BEGIN IMMEDIATE} before
+reading and validating the invariant. The transaction reserves
+the writer slot before making its decision, preventing another
+writer from independently completing the same read-then-write
+sequence at the same time.
+
+The observed test confirms that a second connection can be blocked
+from acquiring the writer reservation while the first holds it.
+A full demonstration that the same write-skew schedule is prevented
+and that the final application invariant is preserved would require
+running and recording the complete read, validation, update, and
+final-state sequence.
+
+The trade-off is that competing writers must serialize, which can
+increase waiting time. If a connection cannot acquire the writer
+reservation within its timeout, it may receive \texttt{SQLITE\_BUSY}
+and need to retry its transaction.
+
+% ============================================================
+\section{Conclusion}
+% ============================================================
+
+In this assignment, I examined the query plans of several ScrollSense
+queries on a scaled SQLite database. The index experiments changed
+the access paths used for F4, F7, and F12. In particular, SQLite
+used the signal-type index for the retraction query, the session
+date-range index for F7, and the persistent covering index for
+F12's correlated completion check.
+
+I also compared textbook join-cost estimates. Under the simplified
+page model, block nested-loop join has a much larger estimated
+transfer cost than two-pass sort-merge or Grace hash join for the
+selected input sizes. These estimates are theoretical and do not
+represent measured SQLite costs, because SQLite's actual execution
+uses the join strategies available to it and the indexes in the
+database.
+
+For predicate pushdown, I rewrote F7 so that the date filter is
+explicitly applied to \texttt{Session} before the joins. The captured
+execution plan already shows an indexed range search on
+\texttt{Session}, so the plan supports early filtering but does
+not establish an additional speedup from the rewrite.
+
+Finally, the two-connection experiment demonstrated that
+\texttt{BEGIN IMMEDIATE} reserves the writer slot and prevents a
+second connection from acquiring it while the first holds it.
+The proposed write-skew schedule has a cyclic precedence graph,
+but a committed anomalous outcome was not observed. I have kept
+this distinction explicit in the report.
+
+The main limitation of the current experimental record is the lack
+of a complete, controlled set of before-and-after wall-clock
+measurements for all three index experiments and for both versions
+of the predicate-pushdown query. The report therefore uses the
+recorded plans and runtime evidence without claiming unmeasured
+performance improvements.
+
+% ============================================================
+\section*{Appendix: Reproducibility and Assistance}
+% ============================================================
+
+The working directory contains the SQL queries, schema, view
+definitions, index definitions, data-generation script, transaction
+demonstration, and analysis notes used in this work. The scaled
+database was kept separate from the original Assignment 1 files.
+The concurrency test was performed on a disposable database copy.
+
+I used an AI assistant for help with understanding execution plans,
+structuring explanations, and editing the report. The final report
+should be read alongside the SQL files and the recorded experimental
+evidence. Any code, interpretation, and results submitted remain
+my responsibility to verify against the assignment requirements.
+
+\end{document}
